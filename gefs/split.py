@@ -142,10 +142,11 @@ def find_best_split(node, tree, random_state):
     best_score = -1e6
     best_split = None
     np.random.seed(random_state)
-    vars = np.random.choice(np.arange(tree.X.shape[1]), tree.max_features, replace=False)
+    max_features = tree.max_features
+    vars = np.random.choice(np.arange(tree.X.shape[1]), max_features, replace=False)
     X = tree.X[node.idx, :]
     y = tree.y[node.idx]
-    for i in range(tree.max_features):
+    for i in range(max_features):
         var = vars[i]
         x = X[:, var]
         nan_mask = np.isnan(x)

@@ -7,8 +7,9 @@ import numpy as np
 
 from .signed import (signed, signed_max, signed_min, signed_max_vec, signed_min_vec,
                     signed_prod, signed_sum, signed_sum_vec, signed_econtaminate, signed_join)
-from .utils import (bincount, logtrunc_phi, isin, isin_arr, lse, logsumexp2,
-                    logsumexp3, nb_argmax, nb_argsort, categorical, sample_trunc_phi)
+from .utils import (bincount, logtrunc_phi, Phi, Phi_inv, phi, isin, isin_arr,
+                    lse, logsumexp2, logsumexp3, nb_argmax, nb_argsort,
+                    categorical, sample_trunc_phi)
 
 
 node_type = deferred_type()
@@ -37,6 +38,19 @@ spec['p'] = optional(float64[:])  # Parameters of multinomial distribution
 spec['logp'] = optional(float64[:])  # Log of Parameters of multinomial dist.
 spec['upper'] = float64[:]  # Same as a and b, but defined over the entire scope (relevant for all nodes)
 spec['lower'] = float64[:]  # Same as a and b, but defined over the entire scope (relevant for all nodes)
+spec['rho'] = float64  # Mixture weight for residual Gaussian-copula leaves.
+spec['tcr_ncat'] = optional(int64[:])
+spec['tcr_copula_scope'] = optional(int64[:])
+spec['tcr_class_logp'] = optional(float64[:])
+spec['tcr_logp0_cat'] = optional(float64[:, :])
+spec['tcr_logp1_cat'] = optional(float64[:, :, :])
+spec['tcr_mean0'] = optional(float64[:])
+spec['tcr_std0'] = optional(float64[:])
+spec['tcr_mean1'] = optional(float64[:, :])
+spec['tcr_std1'] = optional(float64[:, :])
+spec['tcr_corr1'] = optional(float64[:, :, :])
+spec['tcr_lower'] = optional(float64[:])
+spec['tcr_upper'] = optional(float64[:])
 
 
 @jitclass(spec)
@@ -68,6 +82,20 @@ class Node:
         self.logcounts = None
         self.upper = np.ones(len(scope))*(np.Inf)
         self.lower = np.ones(len(scope))*(-np.Inf)
+        # Residual Gaussian-copula leaf params
+        self.rho = 0.
+        self.tcr_ncat = None
+        self.tcr_copula_scope = None
+        self.tcr_class_logp = None
+        self.tcr_logp0_cat = None
+        self.tcr_logp1_cat = None
+        self.tcr_mean0 = None
+        self.tcr_std0 = None
+        self.tcr_mean1 = None
+        self.tcr_std1 = None
+        self.tcr_corr1 = None
+        self.tcr_lower = None
+        self.tcr_upper = None
 
     @property
     def children(self):
@@ -141,6 +169,10 @@ def MultinomialLeaf(scope, n):
     return Node(scope, 'M', n)
 
 @njit
+def ResidualGaussianCopulaLeaf(scope, n):
+    return Node(scope, 'R', n)
+
+@njit
 def UniformLeaf(scope, n, value):
     node = Node(scope, 'U', n)
     node.value = value
@@ -153,7 +185,7 @@ def UniformLeaf(scope, n, value):
 
 
 def n_nodes(node):
-    if node.type in ['L', 'G', 'M']:
+    if node.type in ['L', 'G', 'M', 'R']:
         return 1
     if node.type in ['S', 'P']:
         n = 1 + np.sum([n_nodes(c) for c in node.children])
@@ -309,6 +341,205 @@ def eval_m(node, evi):
 
 
 @njit
+def logsumexp2_scalar(a, b):
+    if a == -np.Inf:
+        return b
+    if b == -np.Inf:
+        return a
+    if a > b:
+        return a + np.log1p(np.exp(b - a))
+    return b + np.log1p(np.exp(a - b))
+
+
+@njit
+def log_trunc_phi_scalar(x, loc, scale, a, b):
+    if np.isnan(x):
+        return 0.
+    if (x < a) or (x > b):
+        return -np.Inf
+    denom = Phi(b, loc, scale) - Phi(a, loc, scale)
+    if denom <= 0.:
+        return -np.Inf
+    return np.log(phi(x, loc, scale) / denom)
+
+
+@njit
+def trunc_phi_cdf_scalar(x, loc, scale, a, b):
+    denom = Phi(b, loc, scale) - Phi(a, loc, scale)
+    if denom <= 0.:
+        return 0.5
+    u = (Phi(x, loc, scale) - Phi(a, loc, scale)) / denom
+    eps = 1e-12
+    if u < eps:
+        return eps
+    if u > 1. - eps:
+        return 1. - eps
+    return u
+
+
+@njit
+def eval_tcr_cat_logp(logp_cat, ncat, var, x):
+    if np.isnan(x):
+        return 0.
+    cat = int(x)
+    if (cat < 0) or (cat >= ncat[var]):
+        return np.log(1e-12)
+    return logp_cat[var, cat]
+
+
+@njit
+def eval_tcr_cat_logp_class(logp_cat, ncat, c, var, x):
+    if np.isnan(x):
+        return 0.
+    cat = int(x)
+    if (cat < 0) or (cat >= ncat[var]):
+        return np.log(1e-12)
+    return logp_cat[c, var, cat]
+
+
+@njit
+def eval_tcr_features0_instance(node, x):
+    """Compatible branch feature likelihood p_v^0(x_obs)."""
+    n_features = node.tcr_ncat.shape[0] - 1
+    logp = 0.
+    for var in range(n_features):
+        value = x[var]
+        if node.tcr_ncat[var] > 1:
+            lp = eval_tcr_cat_logp(node.tcr_logp0_cat, node.tcr_ncat, var, value)
+        else:
+            lp = log_trunc_phi_scalar(value, node.tcr_mean0[var],
+                                      node.tcr_std0[var],
+                                      node.tcr_lower[var],
+                                      node.tcr_upper[var])
+        if lp == -np.Inf:
+            return -np.Inf
+        logp += lp
+    return logp
+
+
+@njit
+def eval_tcr_gaussian_copula_logp(node, c, x):
+    """Gaussian copula density over observed continuous variables."""
+    d = node.tcr_copula_scope.shape[0]
+    if d <= 1:
+        return 0.
+
+    n_obs = 0
+    for pos in range(d):
+        var = node.tcr_copula_scope[pos]
+        if not np.isnan(x[var]):
+            n_obs += 1
+    if n_obs <= 1:
+        return 0.
+
+    z = np.empty(n_obs, dtype=np.float64)
+    obs_pos = np.empty(n_obs, dtype=np.int64)
+    idx = 0
+    for pos in range(d):
+        var = node.tcr_copula_scope[pos]
+        value = x[var]
+        if not np.isnan(value):
+            u = trunc_phi_cdf_scalar(value, node.tcr_mean1[c, var],
+                                     node.tcr_std1[c, var],
+                                     node.tcr_lower[var],
+                                     node.tcr_upper[var])
+            z[idx] = Phi_inv(u, 0., 1.)
+            obs_pos[idx] = pos
+            idx += 1
+
+    corr = np.empty((n_obs, n_obs), dtype=np.float64)
+    for i in range(n_obs):
+        for j in range(n_obs):
+            corr[i, j] = node.tcr_corr1[c, obs_pos[i], obs_pos[j]]
+
+    det = np.linalg.det(corr)
+    if (det <= 0.) or np.isnan(det):
+        return 0.
+    inv_corr = np.linalg.inv(corr)
+    quad = 0.
+    for i in range(n_obs):
+        for j in range(n_obs):
+            v = inv_corr[i, j]
+            if i == j:
+                v -= 1.
+            quad += z[i] * v * z[j]
+    return -0.5 * np.log(det) - 0.5 * quad
+
+
+@njit
+def eval_tcr_features1_instance(node, c, x):
+    """Expressive branch feature likelihood p_v^1(x_obs | y=c)."""
+    n_features = node.tcr_ncat.shape[0] - 1
+    logp = 0.
+    for var in range(n_features):
+        value = x[var]
+        if node.tcr_ncat[var] > 1:
+            lp = eval_tcr_cat_logp_class(node.tcr_logp1_cat, node.tcr_ncat,
+                                         c, var, value)
+        else:
+            lp = log_trunc_phi_scalar(value, node.tcr_mean1[c, var],
+                                      node.tcr_std1[c, var],
+                                      node.tcr_lower[var],
+                                      node.tcr_upper[var])
+        if lp == -np.Inf:
+            return -np.Inf
+        logp += lp
+
+    copula_logp = eval_tcr_gaussian_copula_logp(node, c, x)
+    if copula_logp == -np.Inf:
+        return -np.Inf
+    return logp + copula_logp
+
+
+@njit
+def eval_tcr_class_instance(node, x, c):
+    logp0 = eval_tcr_features0_instance(node, x)
+    if node.rho <= 0.:
+        return node.tcr_class_logp[c] + logp0
+
+    logp1 = eval_tcr_features1_instance(node, c, x)
+    if node.rho >= 1.:
+        return node.tcr_class_logp[c] + logp1
+
+    log0 = np.log(1. - node.rho) + logp0
+    log1 = np.log(node.rho) + logp1
+    return node.tcr_class_logp[c] + logsumexp2_scalar(log0, log1)
+
+
+@njit
+def eval_tcr(node, evi):
+    """Evaluates a residual Gaussian-copula leaf."""
+    n_classes = node.tcr_class_logp.shape[0]
+    class_var = node.tcr_ncat.shape[0] - 1
+    has_class = evi.shape[1] > class_var
+    res = np.zeros(evi.shape[0], dtype=np.float64)
+    for i in range(evi.shape[0]):
+        if has_class and not np.isnan(evi[i, class_var]):
+            c = int(evi[i, class_var])
+            if (c < 0) or (c >= n_classes):
+                res[i] = -np.Inf
+            else:
+                res[i] = eval_tcr_class_instance(node, evi[i, :], c)
+        else:
+            lp = -np.Inf
+            for c in range(n_classes):
+                lp = logsumexp2_scalar(lp, eval_tcr_class_instance(node, evi[i, :], c))
+            res[i] = lp
+    return res
+
+
+@njit
+def eval_tcr_class(node, evi, n_classes, naive):
+    res = np.zeros((evi.shape[0], n_classes), dtype=np.float64)
+    if naive:
+        return res + node.logcounts
+    for i in range(evi.shape[0]):
+        for c in range(n_classes):
+            res[i, c] = eval_tcr_class_instance(node, evi[i, :], c)
+    return res
+
+
+@njit
 def compute_batch_size(n_points, n_features):
     maxmem = max(n_points * n_features + (n_points)/10, 10 * 2 ** 17)
     batch_size = (-n_features + np.sqrt(n_features ** 2 + 4 * maxmem)) / 2
@@ -379,6 +610,8 @@ def evaluate(node, evi):
         return eval_m(node, evi)
     elif node.type == 'G':
         return eval_gaussian(node, evi)
+    elif node.type == 'R':
+        return eval_tcr(node, evi)
     elif node.type == 'U':
         return np.ones(evi.shape[0]) * node.value
     elif node.type == 'P':
@@ -481,6 +714,8 @@ def evaluate_class(node, evi, class_var, n_classes, naive):
             return res
         res[:, 0] = eval_gaussian(node, evi)
         return res
+    elif node.type == 'R':
+        return eval_tcr_class(node, evi, n_classes, naive)
     elif node.type == 'U':
         if naive:
             return np.zeros((evi.shape[0], 1))
@@ -488,11 +723,9 @@ def evaluate_class(node, evi, class_var, n_classes, naive):
     elif node.type == 'P':
         logprs = np.zeros((evi.shape[0], n_classes, node.nchildren), dtype=np.float64)
         logprs[:, :, 0] = evaluate_class(node.children[0], evi, class_var, n_classes, naive)
-        nonzero = ~np.isinf(logprs[:, 0, 0])
-        if np.sum(nonzero) > 0:
-            for i in range(1, node.nchildren):
-                # Only evaluate nonzero examples to save computation
-                logprs[nonzero, :, i] = evaluate_class(node.children[i], evi[nonzero, :], class_var, n_classes, naive)
+        for i in range(1, node.nchildren):
+            logprs[:, :, i] = evaluate_class(node.children[i], evi,
+                                             class_var, n_classes, naive)
         return np.sum(logprs, axis=2)
     elif node.type == 'S':
         logprs = np.zeros((evi.shape[0], n_classes, node.nchildren), dtype=np.float64)
@@ -849,6 +1082,8 @@ def set_tempw(node, evi):
         return eval_m(node, evi)
     elif node.type == 'G':
         return eval_gaussian(node, evi)
+    elif node.type == 'R':
+        return eval_tcr(node, evi)
     elif node.type == 'U':
         return np.ones(evi.shape[0]) * node.value
     elif node.type == 'P':

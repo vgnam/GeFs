@@ -7,10 +7,10 @@ import numpy as np
 import scipy.stats as stats
 from .statsutils import chi_test, kruskal, kendalltau
 
-# Import erfinv from scipy special into numba
-addr = get_cython_function_address("scipy.special.cython_special", "erfinv")
+# Import ndtri (standard normal inverse CDF) from scipy special into numba.
+addr = get_cython_function_address("scipy.special.cython_special", "ndtri")
 functype = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_double)
-erfinv_fn = functype(addr)
+ndtri_fn = functype(addr)
 
 
 @njit
@@ -113,7 +113,7 @@ def Phi_inv(p, loc, scale):
     """
         Percent Point Function (inverse cdf) of normal distribution.
     """
-    return loc + scale * np.sqrt(2) * erfinv_fn(2*p -1)
+    return loc + scale * ndtri_fn(p)
 
 
 @njit

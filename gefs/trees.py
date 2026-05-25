@@ -13,6 +13,7 @@ from tqdm import tqdm
 from .learning import LearnSPN, fit
 from .nodes import SumNode, ProdNode, Leaf, GaussianLeaf, MultinomialLeaf, fit_multinomial, fit_gaussian
 from .pc import PC
+from .tcr import make_residual_gaussian_copula_leaf
 from .utils import bincount, isin_nb, resample_strat
 from .split import find_best_split, Split
 
@@ -129,7 +130,7 @@ def build_tree(tree, parent, counts, ordered_ids):
     np.random.seed(tree.random_state)
     while len(queue) > 0:
         node = queue.pop(0)
-        split = find_best_split(node, tree, np.random.randint(1e6))
+        split = find_best_split(node, tree, np.random.randint(1000000))
         if split is not None:
             node.split = split
             left_child = TreeNode(n_nodes, split.left_counts, node,
@@ -162,7 +163,7 @@ def build_forest(X, y, n_estimators, bootstrap, ncat, imp_measure,
     n_threads = nb.config.NUMBA_DEFAULT_NUM_THREADS
     np.random.seed(random_state)
     estimators = [Tree(ncat, imp_measure, min_samples_split, min_samples_leaf,
-                       max_features, max_depth, surrogate, np.random.randint(1e6))
+                       max_features, max_depth, surrogate, np.random.randint(1000000))
                   for i in range(n_estimators)]
 
     sizes = np.full(n_threads, n_estimators // n_threads, dtype=np.int64)
@@ -302,8 +303,32 @@ def add_dist(tree_node, pc_node, data, ncat, learnspn, max_height, thr,
         return None
 
 
+def add_tcr_dist(tree_node, pc_node, data, ncat, rho, minstd, smoothing,
+                 copula_reg, min_samples_copula):
+    n_points = len(tree_node.idx)
+    data_leaf = data[tree_node.idx, :]
+    scope = np.arange(data.shape[1], dtype=np.int64)
+    lp = np.sum(np.where(ncat == 1, 0, ncat)) * smoothing
+    leaf = make_residual_gaussian_copula_leaf(
+        scope,
+        data_leaf,
+        ncat,
+        pc_node.upper,
+        pc_node.lower,
+        rho=rho,
+        minstd=minstd,
+        smoothing=smoothing,
+        copula_reg=copula_reg,
+        min_samples_copula=min_samples_copula,
+    )
+    leaf.n = n_points + lp
+    pc_node.add_child(leaf)
+    return None
+
+
 def tree2pc(tree, learnspn=np.Inf, max_height=1000000, thr=0.01,
-            minstd=1, smoothing=1e-6):
+            minstd=1, smoothing=1e-6, tcr=False, rho=0.5,
+            copula_reg=1e-6, min_samples_copula=5):
     """
         Converts a Decision Tree into a Probabilistic Circuit.
 
@@ -324,6 +349,15 @@ def tree2pc(tree, learnspn=np.Inf, max_height=1000000, thr=0.01,
             The minimum standard deviation of gaussian leaves.
         smoothing: float
             Additive smoothing (Laplace smoothing) for categorical data.
+        tcr: boolean
+            If True, use residual class-conditional Gaussian-copula leaves.
+        rho: float
+            Mixture weight of the residual branch in each TCR leaf.
+        copula_reg: float
+            Diagonal regularization used when fitting copula correlations.
+        min_samples_copula: int
+            Minimum complete rows per class required to estimate a non-identity
+            Gaussian copula correlation.
     """
     scope = np.array([i for i in range(tree.X.shape[1]+1)], dtype=np.int64)
     data = np.concatenate([tree.X, np.expand_dims(tree.y, axis=1)], axis=1)
@@ -348,8 +382,12 @@ def tree2pc(tree, learnspn=np.Inf, max_height=1000000, thr=0.01,
         pc_node = pc_queue.pop(0)
         # If node is leaf, fit a density estimator
         if tree_node.isleaf:
-            add_dist(tree_node, pc_node, data, ncat, learnspn, max_height, thr,
-                     minstd, smoothing)
+            if tcr:
+                add_tcr_dist(tree_node, pc_node, data, ncat, rho, minstd,
+                             smoothing, copula_reg, min_samples_copula)
+            else:
+                add_dist(tree_node, pc_node, data, ncat, learnspn, max_height,
+                         thr, minstd, smoothing)
         # If node is a decision node, add another split in the PC.
         else:
             p_left, p_right = add_split(tree_node, pc_node, ncat, smoothing, root)
@@ -417,7 +455,7 @@ node_type.define(TreeNode.class_type.instance_type)
     ('min_samples_leaf', int64),  # The minimum number of samples at each leaf.
     ('min_samples_split', int64),  # The minimum number of samples required to define a split.
     ('n_classes', int64),  # Number of classes in the data.
-    ('max_features', optional(int64)),  # Maximum number of features to consider at each split.
+    ('max_features', int64),  # Maximum number of features to consider at each split.
     ('n_nodes', int64),  # Total number of nodes in the tree.
     ('root', TreeNode.class_type.instance_type),  # The root node of the tree (TreeNode object).
     ('depth', int16),  # The depth of the tree.
@@ -440,7 +478,6 @@ class Tree:
         self.imp_measure = imp_measure
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
-        self.max_features = max_features
         self.n_nodes = 0
         self.n_classes = 0
         self.depth = 0
@@ -448,8 +485,11 @@ class Tree:
         self.root = TreeNode(0, np.empty(0, dtype=np.int64), None, np.empty(0, dtype=np.int64), False)
         self.surrogate = surrogate
         if random_state is None:
-            random_state = np.random.randint(1e6)  # Not ideal
+            random_state = np.random.randint(1000000)  # Not ideal
         self.random_state = random_state
+        if max_features is None:
+            max_features = -1
+        self.max_features = max_features
 
     def fit(self, X, y):
         """ Fits the Random Forest to (X, Y). """
@@ -457,7 +497,7 @@ class Tree:
         self.y = y
         self.n_classes = np.max(y)+1
         self.n_nodes = 0
-        if self.max_features is None:
+        if self.max_features < 0:
             self.max_features = X.shape[1]
 
         counts = bincount(y, self.ncat[-1])
@@ -538,7 +578,8 @@ class RandomForest:
                                        self.surrogate, self.random_state)
 
     def topc(self, learnspn=np.Inf, max_height=1000000, thr=0.01, minstd=1,
-             smoothing=1e-6):
+             smoothing=1e-6, tcr=False, rho=0.5, copula_reg=1e-6,
+             min_samples_copula=5):
         """
             Returns a Probabilistic Circuit matching the tree structure.
 
@@ -556,12 +597,23 @@ class RandomForest:
                 The minimum standard deviation of gaussian leaves.
             smoothing: float
                 Additive smoothing (Laplace smoothing) for categorical data.
+            tcr: boolean
+                If True, use residual class-conditional Gaussian-copula leaves.
+            rho: float
+                Mixture weight of the residual branch in each TCR leaf.
+            copula_reg: float
+                Diagonal regularization used when fitting copula correlations.
+            min_samples_copula: int
+                Minimum complete rows per class required to estimate a
+                non-identity Gaussian copula correlation.
         """
         pc = PC(self.ncat)
         pc.root = SumNode(scope=self.scope, n=1)
         for estimator in tqdm(self.estimators):
             tree_pc = tree2pc(estimator, learnspn=learnspn, max_height=max_height,
-                              thr=thr, minstd=minstd, smoothing=smoothing)
+                              thr=thr, minstd=minstd, smoothing=smoothing,
+                              tcr=tcr, rho=rho, copula_reg=copula_reg,
+                              min_samples_copula=min_samples_copula)
             pc.root.add_child(tree_pc.root)
         pc.is_ensemble = True
         return pc

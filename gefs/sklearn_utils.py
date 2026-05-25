@@ -9,6 +9,7 @@ from .nodes import (SumNode, ProdNode, Leaf, GaussianLeaf, MultinomialLeaf,
                    UniformLeaf, fit_multinomial, fit_multinomial_with_counts,
                    fit_gaussian)
 from .pc import PC
+from .tcr import make_residual_gaussian_copula_leaf
 from .utils import bincount
 
 
@@ -81,7 +82,9 @@ def calc_outofbag(n_samples, rf):
 
 
 def tree2pc(tree, X, y, ncat, learnspn=np.Inf, max_height=100000,
-            thr=0.01, minstd=1, smoothing=1e-6, return_pc=True):
+            thr=0.01, minstd=1, smoothing=1e-6, return_pc=True,
+            tcr=False, rho=0.5, copula_reg=1e-6,
+            min_samples_copula=5):
     """
         Parses a sklearn DecisionTreeClassifier to a Generative Decision Tree.
         Note that X, y do not need to match the data used to train the
@@ -111,11 +114,20 @@ def tree2pc(tree, X, y, ncat, learnspn=np.Inf, max_height=100000,
             The minimum standard deviation of gaussian leaves.
         smoothing: float
             Additive smoothing (Laplace smoothing) for categorical data.
+        tcr: boolean
+            If True, use residual class-conditional Gaussian-copula leaves.
+        rho: float
+            Mixture weight of the residual branch in each TCR leaf.
+        copula_reg: float
+            Diagonal regularization used when fitting copula correlations.
+        min_samples_copula: int
+            Minimum complete rows per class required to estimate a non-identity
+            Gaussian copula correlation.
 
     https://stackoverflow.com/questions/20224526/how-to-extract-the-decision-rules-from-scikit-learn-decision-tree
     """
 
-    scope = np.array([i for i in range(X.shape[1]+1)]).astype(int)
+    scope = np.array([i for i in range(X.shape[1]+1)], dtype=np.int64)
     data = np.concatenate([X, np.expand_dims(y, axis=1)], axis=1)
     lp = np.sum(np.where(ncat==1, 0, ncat)) * smoothing # LaPlace counts
     classcol = len(ncat)-1
@@ -138,7 +150,7 @@ def tree2pc(tree, X, y, ncat, learnspn=np.Inf, max_height=100000,
             split1 = data[np.where(data[:, split_var] <= split_value)]
             p1 = ProdNode(scope=scope, n=split1.shape[0]+lp)
             sumnode.add_child(p1)
-            ind1 = Leaf(scope=np.array([split_var]), n=split1.shape[0]+lp, value=split_value, comparison=3)  # Comparison <=
+            ind1 = Leaf(scope=np.array([split_var], dtype=np.int64), n=split1.shape[0]+lp, value=split_value, comparison=3)  # Comparison <=
             p1.add_child(ind1)
             recurse(p1, tree_.children_left[node_ind], depth + 1, split1.copy(), upper1, lower1)
             # Parse right node >
@@ -148,24 +160,39 @@ def tree2pc(tree, X, y, ncat, learnspn=np.Inf, max_height=100000,
             split2 = data[np.where(data[:, split_var] > split_value)]
             p2 = ProdNode(scope=scope, n=split2.shape[0]+lp)
             sumnode.add_child(p2)
-            ind2 = Leaf(scope=np.array([split_var]), n=split2.shape[0]+lp, value=split_value, comparison=4)  # Comparison >
+            ind2 = Leaf(scope=np.array([split_var], dtype=np.int64), n=split2.shape[0]+lp, value=split_value, comparison=4)  # Comparison >
             p2.add_child(ind2)
             recurse(p2, tree_.children_right[node_ind], depth + 1, split2.copy(), upper2, lower2)
             return sumnode
         # Leaf node
         else:
             assert node is not None, "Tree has no splits."
-            if data.shape[0] >= learnspn:
+            if tcr:
+                leaf = make_residual_gaussian_copula_leaf(
+                    scope,
+                    data,
+                    ncat,
+                    upper,
+                    lower,
+                    rho=rho,
+                    minstd=minstd,
+                    smoothing=smoothing,
+                    copula_reg=copula_reg,
+                    min_samples_copula=min_samples_copula,
+                )
+                leaf.n = data.shape[0] + lp
+                node.add_child(leaf)
+            elif data.shape[0] >= learnspn:
                 learner = LearnSPN(ncat, thr, 2, max_height, None)
                 fit(learner, data, node)
             else:
                 for var in scope:
                     if ncat[var] > 1:  # Categorical variable
-                        leaf = MultinomialLeaf(scope=np.array([var]), n=data.shape[0]+lp)
+                        leaf = MultinomialLeaf(scope=np.array([var], dtype=np.int64), n=data.shape[0]+lp)
                         node.add_child(leaf)
                         fit_multinomial(leaf, data, int(ncat[var]), smoothing)
                     else:  # Continuous variable
-                        leaf = GaussianLeaf(scope=np.array([var]), n=data.shape[0]+lp)
+                        leaf = GaussianLeaf(scope=np.array([var], dtype=np.int64), n=data.shape[0]+lp)
                         node.add_child(leaf)
                         fit_gaussian(leaf, data, upper[var], lower[var], minstd)
                 return None
@@ -190,7 +217,8 @@ def tree2pc(tree, X, y, ncat, learnspn=np.Inf, max_height=100000,
 
 
 def rf2pc(rf, X_train, y_train, ncat, learnspn=np.Inf, max_height=10000,
-          thr=0.01, minstd=1, smoothing=1e-6):
+          thr=0.01, minstd=1, smoothing=1e-6, tcr=False, rho=0.5,
+          copula_reg=1e-6, min_samples_copula=5):
     """
         Parses a sklearn RandomForestClassifier to a Generative Forest.
         Note that X, y do not need to match the data used to train the
@@ -218,8 +246,17 @@ def rf2pc(rf, X_train, y_train, ncat, learnspn=np.Inf, max_height=10000,
             The minimum standard deviation of gaussian leaves.
         smoothing: float
             Additive smoothing (Laplace smoothing) for categorical data.
+        tcr: boolean
+            If True, use residual class-conditional Gaussian-copula leaves.
+        rho: float
+            Mixture weight of the residual branch in each TCR leaf.
+        copula_reg: float
+            Diagonal regularization used when fitting copula correlations.
+        min_samples_copula: int
+            Minimum complete rows per class required to estimate a non-identity
+            Gaussian copula correlation.
     """
-    scope = np.arange(len(ncat)).astype(int)
+    scope = np.arange(len(ncat), dtype=np.int64)
     lp = np.sum(np.where(ncat==1, 0, ncat)) * smoothing # LaPlace counts
     classcol = len(ncat)-1
     data = np.concatenate([X_train, np.expand_dims(y_train, axis=1)], axis=1)
@@ -230,7 +267,9 @@ def rf2pc(rf, X_train, y_train, ncat, learnspn=np.Inf, max_height=10000,
         X_tree = X_train[sample_idx[i], :]
         y_tree = y_train[sample_idx[i]]
         si = tree2pc(tree, X_tree, y_tree, ncat, learnspn, max_height,
-                     thr, minstd, smoothing, return_pc=False)
+                     thr, minstd, smoothing, return_pc=False, tcr=tcr,
+                     rho=rho, copula_reg=copula_reg,
+                     min_samples_copula=min_samples_copula)
         pc.root.add_child(si)
     pc.is_ensemble = True
     return pc
