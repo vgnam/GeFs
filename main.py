@@ -1,6 +1,8 @@
 import argparse
 import gc
+import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +11,14 @@ from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
 
 from gefs import RandomForest
+from gefs.tcr_tuning import (
+    get_tcr_rhos,
+    random_forest_predict_proba,
+    sanitize_probabilities,
+    set_tcr_rhos,
+    tcr_validation_loss,
+    tune_tcr_rhos,
+)
 
 
 def factorize_columns(df, columns):
@@ -51,6 +61,82 @@ def learncats(data, classcol=-1, continuous_ids=None):
 
 
 def preprocess_known_dataset(name, data_dir):
+    if name in {"wine", "winequality"}:
+        red = pd.read_csv(data_dir / "winequality_red.csv")
+        white = pd.read_csv(data_dir / "winequality_white.csv")
+        df = pd.concat([red, white], ignore_index=True)
+        df["quality"] = np.where(df["quality"] <= 6, 0, 1)
+        data = df.values.astype(float)
+        return data, learncats(data, classcol=-1)
+
+    if name in {"wine-red", "wine_red"}:
+        df = pd.read_csv(data_dir / "winequality_red.csv")
+        df["quality"] = np.where(df["quality"] <= 6, 0, 1)
+        data = df.values.astype(float)
+        return data, learncats(data, classcol=-1)
+
+    if name in {"wine-white", "wine_white"}:
+        df = pd.read_csv(data_dir / "winequality_white.csv")
+        df["quality"] = np.where(df["quality"] <= 6, 0, 1)
+        data = df.values.astype(float)
+        return data, learncats(data, classcol=-1)
+
+    if name in {"breast", "wdbc"}:
+        df = pd.read_csv(data_dir / "wdbc.csv")
+        df = factorize_columns(df, ["Class"])
+        data = df.values.astype(float)
+        ncat = np.ones(data.shape[1], dtype=np.int64)
+        ncat[-1] = df["Class"].nunique()
+        return data, ncat
+
+    if name == "vehicle":
+        df = pd.read_csv(data_dir / "vehicle.csv")
+        df = factorize_columns(df, ["Class"])
+        data = df.values.astype(float)
+        ncat = np.ones(data.shape[1], dtype=np.int64)
+        ncat[-1] = df["Class"].nunique()
+        return data, ncat
+
+    if name == "segment":
+        df = pd.read_csv(data_dir / "segment.csv")
+        df = df.drop(columns=["region.centroid.col", "region.pixel.count"])
+        cat_cols = ["short.line.density.5", "short.line.density.2", "class"]
+        cont_cols = [
+            "region.centroid.row",
+            "vedge.mean",
+            "vegde.sd",
+            "hedge.mean",
+            "hedge.sd",
+            "intensity.mean",
+            "rawred.mean",
+            "rawblue.mean",
+            "rawgreen.mean",
+            "exred.mean",
+            "exblue.mean",
+            "exgreen.mean",
+            "value.mean",
+            "saturation.mean",
+            "hue.mean",
+        ]
+        df = factorize_columns(df, cat_cols)
+        data = df.values.astype(float)
+        continuous_ids = [df.columns.get_loc(col) for col in cont_cols]
+        return data, learncats(data, classcol=-1, continuous_ids=continuous_ids)
+
+    if name == "vowel":
+        df = pd.read_csv(data_dir / "vowel.csv")
+        df = factorize_columns(df, ["Speaker_Number", "Sex", "Class"])
+        data = df.values.astype(float)
+        return data, learncats(data, classcol=-1)
+
+    if name in {"mice", "miceprotein"}:
+        df = pd.read_csv(data_dir / "miceprotein.csv")
+        df = df.replace("?", np.nan)
+        df = df.drop(columns=["MouseID", "Genotype", "Treatment", "Behavior"])
+        df = factorize_columns(df, ["class"])
+        data = df.values.astype(float)
+        return data, learncats(data, classcol=-1)
+
     if name == "german":
         df = pd.read_csv(data_dir / "german.csv", sep=" ", header=None)
         cat_cols = [0, 2, 3, 5, 6, 8, 9, 11, 13, 14, 16, 18, 19, 20]
@@ -113,12 +199,32 @@ def preprocess_known_dataset(name, data_dir):
 
 
 def load_dataset(name, data_dir):
-    if name in {"german", "cmc", "bank"}:
+    builtin = {
+        "german",
+        "cmc",
+        "bank",
+        "wine",
+        "winequality",
+        "wine-red",
+        "wine_red",
+        "wine-white",
+        "wine_white",
+        "breast",
+        "wdbc",
+        "vehicle",
+        "segment",
+        "vowel",
+        "mice",
+        "miceprotein",
+    }
+    if name in builtin:
         return preprocess_known_dataset(name, data_dir)
 
     path = Path(name)
     if not path.exists():
         path = data_dir / name
+    if not path.exists() and path.suffix == "":
+        path = path.with_suffix(".csv")
     if not path.exists():
         raise FileNotFoundError(f"Cannot find dataset '{name}'")
 
@@ -133,9 +239,10 @@ def load_dataset(name, data_dir):
     return data, learncats(data, classcol=-1)
 
 
-def standardize_from_train(train, test, ncat):
+def standardize_from_train(train, test, ncat, *extra):
     train = train.copy()
-    test = test.copy()
+    others = [test.copy()]
+    others.extend(arr.copy() for arr in extra)
     for col in range(train.shape[1] - 1):
         if ncat[col] != 1:
             continue
@@ -144,8 +251,9 @@ def standardize_from_train(train, test, ncat):
         if std <= 0 or np.isnan(std):
             continue
         train[:, col] = np.clip((train[:, col] - mean) / std, -6, 6)
-        test[:, col] = np.clip((test[:, col] - mean) / std, -6, 6)
-    return train, test
+        for arr in others:
+            arr[:, col] = np.clip((arr[:, col] - mean) / std, -6, 6)
+    return (train, *others)
 
 
 def maybe_subsample(data, max_rows, seed):
@@ -180,6 +288,7 @@ def evaluate_method(name, pc, X, y, n_classes):
     start = time.perf_counter()
     pred, prob = pc.classify_avg(X, return_prob=True)
     elapsed = time.perf_counter() - start
+    prob = sanitize_probabilities(prob, n_classes)
     return {
         "method": name,
         "accuracy": accuracy_score(y, pred),
@@ -188,10 +297,67 @@ def evaluate_method(name, pc, X, y, n_classes):
     }
 
 
+def _safe_filename(value):
+    value = str(value)
+    safe = []
+    for char in value:
+        if char.isalnum() or char in "-_.":
+            safe.append(char)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("._") or "run"
+
+
+def _json_default(value):
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def save_run_results(results_df, args, root, run_info):
+    output_dir = Path(args.results_dir)
+    if not output_dir.is_absolute():
+        output_dir = root / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    dataset = _safe_filename(Path(str(args.dataset)).stem)
+    stem = f"{timestamp}_{dataset}_seed{args.seed}"
+    csv_path = output_dir / f"{stem}_results.csv"
+    json_path = output_dir / f"{stem}_run.json"
+
+    saved = results_df.copy()
+    saved.insert(0, "dataset", args.dataset)
+    saved.insert(1, "seed", args.seed)
+    saved.insert(2, "missing_rate", args.missing_rate)
+    saved.to_csv(csv_path, index=False)
+
+    metadata = {
+        "args": vars(args),
+        "run": run_info,
+        "results": saved.to_dict(orient="records"),
+    }
+    with json_path.open("w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=2, sort_keys=True, default=_json_default)
+
+    return csv_path, json_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare GeF and TCR-GeF on the same train/test split.")
-    parser.add_argument("--dataset", default="cmc", help="Built-in name: cmc, german, bank; or path to a CSV.")
+    parser.add_argument(
+        "--dataset",
+        default="cmc",
+        help="Built-in name: cmc, german, bank, vehicle, breast, segment, vowel, wine, mice; or path to a CSV.",
+    )
     parser.add_argument("--test-size", type=float, default=0.3)
+    parser.add_argument("--val-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-estimators", type=int, default=5)
     parser.add_argument("--max-depth", type=int, default=8)
@@ -202,8 +368,14 @@ def main():
     parser.add_argument("--smoothing", type=float, default=1e-6)
     parser.add_argument("--copula-reg", type=float, default=1e-6)
     parser.add_argument("--min-samples-copula", type=int, default=5)
+    parser.add_argument("--beta", type=float, default=1.0, help="Weight of KL(p_RF || p_rho) on validation.")
+    parser.add_argument("--gamma", type=float, default=0.01, help="Weight of sum_v rho_v^2 regularization.")
+    parser.add_argument("--rho-grid-size", type=int, default=21, help="Number of [0, 1] grid points for validation rho tuning.")
+    parser.add_argument("--no-tune-rho", action="store_true", help="Disable validation tuning of per-leaf TCR rho values.")
     parser.add_argument("--missing-rate", type=float, default=0.0)
     parser.add_argument("--max-rows", type=int, default=None, help="Optional stratified subsample for quick runs.")
+    parser.add_argument("--results-dir", default="results", help="Directory where run results are saved.")
+    parser.add_argument("--no-save-results", action="store_true", help="Do not save CSV/JSON result files.")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -211,20 +383,43 @@ def main():
     data = maybe_subsample(data, args.max_rows, args.seed)
 
     y = data[:, -1].astype(np.int64)
-    train, test = train_test_split(
+    train_full, test = train_test_split(
         data,
         test_size=args.test_size,
         random_state=args.seed,
         stratify=y,
     )
-    train, test = standardize_from_train(train, test, ncat)
+    use_validation = args.val_size > 0 and not args.no_tune_rho
+    if use_validation:
+        train, val = train_test_split(
+            train_full,
+            test_size=args.val_size,
+            random_state=args.seed + 17,
+            stratify=train_full[:, -1].astype(np.int64),
+        )
+    else:
+        train, val = train_full, None
+
+    if val is None:
+        train, test = standardize_from_train(train, test, ncat)
+    else:
+        train, val, test = standardize_from_train(train, val, ncat, test)
+
     X_train, y_train = train[:, :-1], train[:, -1].astype(np.int64)
+    if val is not None:
+        X_val, y_val = val[:, :-1], val[:, -1].astype(np.int64)
+    else:
+        X_val, y_val = None, None
     X_test, y_test = test[:, :-1], test[:, -1].astype(np.int64)
     X_eval = add_missing_values(X_test, args.missing_rate, args.seed + 1)
+    n_classes = int(ncat[-1])
 
     print(f"Dataset: {args.dataset}")
-    print(f"Train/test: {X_train.shape[0]}/{X_test.shape[0]}")
-    print(f"Classes: {int(ncat[-1])}")
+    if X_val is None:
+        print(f"Train/test: {X_train.shape[0]}/{X_test.shape[0]}")
+    else:
+        print(f"Train/validation/test: {X_train.shape[0]}/{X_val.shape[0]}/{X_test.shape[0]}")
+    print(f"Classes: {n_classes}")
     print(f"Missing rate on shared eval X: {args.missing_rate:.2f}")
 
     start = time.perf_counter()
@@ -237,11 +432,13 @@ def main():
         random_state=args.seed,
     )
     rf.fit(X_train, y_train)
-    print(f"RF training: {time.perf_counter() - start:.2f}s")
+    rf_training_sec = time.perf_counter() - start
+    print(f"RF training: {rf_training_sec:.2f}s")
 
     start = time.perf_counter()
     gef = rf.topc(minstd=args.minstd, smoothing=args.smoothing)
-    print(f"GeF conversion: {time.perf_counter() - start:.2f}s")
+    gef_conversion_sec = time.perf_counter() - start
+    print(f"GeF conversion: {gef_conversion_sec:.2f}s")
 
     start = time.perf_counter()
     tcr = rf.topc(
@@ -252,14 +449,99 @@ def main():
         copula_reg=args.copula_reg,
         min_samples_copula=args.min_samples_copula,
     )
-    print(f"TCR-GeF conversion: {time.perf_counter() - start:.2f}s")
+    tcr_conversion_sec = time.perf_counter() - start
+    print(f"TCR-GeF conversion: {tcr_conversion_sec:.2f}s")
+
+    tuning_summary = None
+    if X_val is not None and not args.no_tune_rho:
+        p_rf_val = random_forest_predict_proba(rf, X_val)
+        initial_rhos = get_tcr_rhos(tcr)
+        before = tcr_validation_loss(
+            tcr,
+            X_val,
+            y_val,
+            p_rf_val,
+            beta=args.beta,
+            gamma=args.gamma,
+        )
+        start = time.perf_counter()
+        tuning = tune_tcr_rhos(
+            rf,
+            tcr,
+            X_val,
+            y_val,
+            p_rf_val,
+            beta=args.beta,
+            gamma=args.gamma,
+            rho_grid_size=args.rho_grid_size,
+        )
+        elapsed = time.perf_counter() - start
+        after = tcr_validation_loss(
+            tcr,
+            X_val,
+            y_val,
+            p_rf_val,
+            beta=args.beta,
+            gamma=args.gamma,
+        )
+        kept_tuned_rhos = True
+        if after["loss"] > before["loss"]:
+            set_tcr_rhos(tcr, initial_rhos)
+            after = tcr_validation_loss(
+                tcr,
+                X_val,
+                y_val,
+                p_rf_val,
+                beta=args.beta,
+                gamma=args.gamma,
+            )
+            kept_tuned_rhos = False
+        print(f"TCR rho tuning: {elapsed:.2f}s")
+        print(
+            "Validation loss: "
+            f"{before['loss']:.6f} -> {after['loss']:.6f} "
+            f"(data {after['data_loss']:.6f}, rho^2 {after['rho_penalty']:.6f})"
+        )
+        print(
+            "Rho leaves: "
+            f"{tuning['n_tuned']}/{tuning['n_leaves']} tuned, "
+            f"mean={tuning['rho_mean']:.4f}, "
+            f"range=[{tuning['rho_min']:.4f}, {tuning['rho_max']:.4f}]"
+        )
+        if not kept_tuned_rhos:
+            print("Tuned rho values were reverted because validation loss increased.")
+        tuning_summary = {
+            "before": before,
+            "after": after,
+            "kept_tuned_rhos": kept_tuned_rhos,
+            "tuning": tuning,
+            "tuning_sec": elapsed,
+        }
 
     results = [
-        evaluate_method("GeF", gef, X_eval, y_test, int(ncat[-1])),
-        evaluate_method("TCR-GeF", tcr, X_eval, y_test, int(ncat[-1])),
+        evaluate_method("GeF", gef, X_eval, y_test, n_classes),
+        evaluate_method("TCR-GeF", tcr, X_eval, y_test, n_classes),
     ]
+    results_df = pd.DataFrame(results)
     print()
-    print(pd.DataFrame(results).to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    print(results_df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+
+    if not args.no_save_results:
+        run_info = {
+            "n_train": X_train.shape[0],
+            "n_validation": 0 if X_val is None else X_val.shape[0],
+            "n_test": X_test.shape[0],
+            "n_features": X_train.shape[1],
+            "n_classes": n_classes,
+            "rf_training_sec": rf_training_sec,
+            "gef_conversion_sec": gef_conversion_sec,
+            "tcr_conversion_sec": tcr_conversion_sec,
+            "tuning": tuning_summary,
+        }
+        csv_path, json_path = save_run_results(results_df, args, root, run_info)
+        print()
+        print(f"Saved results: {csv_path}")
+        print(f"Saved run metadata: {json_path}")
 
     gef.delete()
     tcr.delete()

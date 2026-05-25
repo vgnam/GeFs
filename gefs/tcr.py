@@ -86,6 +86,9 @@ def _fit_gaussian_copula_corr(data, copula_scope, means, stds, lower, upper,
                            lower[var], upper[var])
         z[:, pos] = norm.ppf(u)
 
+    if np.any(np.nanstd(z, axis=0) <= _EPS):
+        return corr
+
     corr = np.corrcoef(z, rowvar=False)
     if corr.ndim == 0:
         return np.eye(d, dtype=np.float64)
