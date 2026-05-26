@@ -7,7 +7,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, log_loss
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    log_loss,
+    precision_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 
 from gefs import RandomForest
@@ -284,15 +290,81 @@ def add_missing_values(X, missing_rate, seed):
     return X
 
 
-def evaluate_method(name, pc, X, y, n_classes):
+def macro_auroc(y, prob, n_classes):
+    y = np.asarray(y, dtype=np.int64)
+    if len(np.unique(y)) < 2:
+        return np.nan
+
+    try:
+        if n_classes == 2:
+            return float(roc_auc_score(y, prob[:, 1]))
+        return float(
+            roc_auc_score(
+                y,
+                prob,
+                labels=np.arange(n_classes),
+                multi_class="ovr",
+                average="macro",
+            )
+        )
+    except ValueError:
+        return np.nan
+
+
+def expected_calibration_error(y, prob, n_bins=15):
+    if n_bins < 1:
+        raise ValueError("n_bins must be at least 1")
+
+    y = np.asarray(y, dtype=np.int64)
+    confidence = np.max(prob, axis=1)
+    pred = np.argmax(prob, axis=1)
+    correct = pred == y
+    ece = 0.
+    bins = np.linspace(0., 1., n_bins + 1)
+
+    for i in range(n_bins):
+        if i == n_bins - 1:
+            in_bin = (confidence >= bins[i]) & (confidence <= bins[i + 1])
+        else:
+            in_bin = (confidence >= bins[i]) & (confidence < bins[i + 1])
+        if not np.any(in_bin):
+            continue
+        bin_weight = np.mean(in_bin)
+        bin_accuracy = np.mean(correct[in_bin])
+        bin_confidence = np.mean(confidence[in_bin])
+        ece += bin_weight * abs(bin_accuracy - bin_confidence)
+
+    return float(ece)
+
+
+def evaluate_method(name, pc, X, y, n_classes, ece_bins=15, lspn=False):
     start = time.perf_counter()
-    pred, prob = pc.classify_avg(X, return_prob=True)
+    if lspn:
+        pred, prob = pc.classify_avg_lspn(X, return_prob=True)
+    else:
+        pred, prob = pc.classify_avg(X, return_prob=True)
     elapsed = time.perf_counter() - start
     prob = sanitize_probabilities(prob, n_classes)
+    pred = np.asarray(pred, dtype=np.int64)
+    labels = np.arange(n_classes)
     return {
         "method": name,
-        "accuracy": accuracy_score(y, pred),
-        "log_loss": log_loss(y, prob, labels=np.arange(n_classes)),
+        "accuracy": float(accuracy_score(y, pred)),
+        "log_loss": float(log_loss(y, prob, labels=labels)),
+        "auroc_macro_ovr": macro_auroc(y, prob, n_classes),
+        "ece": expected_calibration_error(y, prob, ece_bins),
+        "f1_macro": float(
+            f1_score(y, pred, labels=labels, average="macro", zero_division=0)
+        ),
+        "precision_macro": float(
+            precision_score(
+                y,
+                pred,
+                labels=labels,
+                average="macro",
+                zero_division=0,
+            )
+        ),
         "inference_sec": elapsed,
     }
 
@@ -350,7 +422,7 @@ def save_run_results(results_df, args, root, run_info):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare GeF and TCR-GeF on the same train/test split.")
+    parser = argparse.ArgumentParser(description="Compare GeF, GeF-LearnSPN, and TCR-GeF on the same train/test split.")
     parser.add_argument(
         "--dataset",
         default="cmc",
@@ -366,6 +438,10 @@ def main():
     parser.add_argument("--rho", type=float, default=0.5)
     parser.add_argument("--minstd", type=float, default=0.1)
     parser.add_argument("--smoothing", type=float, default=1e-6)
+    parser.add_argument("--learnspn-min-samples", type=int, default=30, help="Minimum leaf samples required to fit LearnSPN.")
+    parser.add_argument("--learnspn-max-height", type=int, default=1000000, help="Maximum depth of LearnSPN structures at leaves.")
+    parser.add_argument("--learnspn-thr", type=float, default=0.01, help="Independence-test threshold for LearnSPN product splits.")
+    parser.add_argument("--skip-learnspn", action="store_true", help="Compare only GeF and TCR-GeF.")
     parser.add_argument("--copula-reg", type=float, default=1e-6)
     parser.add_argument("--min-samples-copula", type=int, default=5)
     parser.add_argument("--beta", type=float, default=1.0, help="Weight of KL(p_RF || p_rho) on validation.")
@@ -373,6 +449,7 @@ def main():
     parser.add_argument("--rho-grid-size", type=int, default=21, help="Number of [0, 1] grid points for validation rho tuning.")
     parser.add_argument("--no-tune-rho", action="store_true", help="Disable validation tuning of per-leaf TCR rho values.")
     parser.add_argument("--missing-rate", type=float, default=0.0)
+    parser.add_argument("--ece-bins", type=int, default=15, help="Number of bins for expected calibration error.")
     parser.add_argument("--max-rows", type=int, default=None, help="Optional stratified subsample for quick runs.")
     parser.add_argument("--results-dir", default="results", help="Directory where run results are saved.")
     parser.add_argument("--no-save-results", action="store_true", help="Do not save CSV/JSON result files.")
@@ -439,6 +516,20 @@ def main():
     gef = rf.topc(minstd=args.minstd, smoothing=args.smoothing)
     gef_conversion_sec = time.perf_counter() - start
     print(f"GeF conversion: {gef_conversion_sec:.2f}s")
+
+    gef_lspn = None
+    gef_lspn_conversion_sec = None
+    if not args.skip_learnspn:
+        start = time.perf_counter()
+        gef_lspn = rf.topc(
+            learnspn=args.learnspn_min_samples,
+            max_height=args.learnspn_max_height,
+            thr=args.learnspn_thr,
+            minstd=args.minstd,
+            smoothing=args.smoothing,
+        )
+        gef_lspn_conversion_sec = time.perf_counter() - start
+        print(f"GeF-LearnSPN conversion: {gef_lspn_conversion_sec:.2f}s")
 
     start = time.perf_counter()
     tcr = rf.topc(
@@ -518,10 +609,22 @@ def main():
             "tuning_sec": elapsed,
         }
 
-    results = [
-        evaluate_method("GeF", gef, X_eval, y_test, n_classes),
-        evaluate_method("TCR-GeF", tcr, X_eval, y_test, n_classes),
-    ]
+    results = [evaluate_method("GeF", gef, X_eval, y_test, n_classes, args.ece_bins)]
+    if gef_lspn is not None:
+        results.append(
+            evaluate_method(
+                "GeF-LearnSPN",
+                gef_lspn,
+                X_eval,
+                y_test,
+                n_classes,
+                args.ece_bins,
+                lspn=True,
+            )
+        )
+    results.append(
+        evaluate_method("TCR-GeF", tcr, X_eval, y_test, n_classes, args.ece_bins)
+    )
     results_df = pd.DataFrame(results)
     print()
     print(results_df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
@@ -535,6 +638,7 @@ def main():
             "n_classes": n_classes,
             "rf_training_sec": rf_training_sec,
             "gef_conversion_sec": gef_conversion_sec,
+            "gef_learnspn_conversion_sec": gef_lspn_conversion_sec,
             "tcr_conversion_sec": tcr_conversion_sec,
             "tuning": tuning_summary,
         }
@@ -544,6 +648,8 @@ def main():
         print(f"Saved run metadata: {json_path}")
 
     gef.delete()
+    if gef_lspn is not None:
+        gef_lspn.delete()
     tcr.delete()
     rf.delete()
     gc.collect()
